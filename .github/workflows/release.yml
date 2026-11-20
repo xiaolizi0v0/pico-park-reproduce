@@ -7,6 +7,10 @@ on:
         description: ID of the draft release containing both player archives
         type: string
         required: true
+      tag:
+        description: Version tag for the published release
+        type: string
+        required: true
 
 permissions:
   # GitHub requires push access even to read a draft release and its assets.
@@ -19,6 +23,7 @@ concurrency:
 env:
   GH_TOKEN: ${{ github.token }}
   RELEASE_ID: ${{ inputs.release-id }}
+  RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
   validate:
@@ -32,11 +37,12 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           release=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
           jq -e --arg sha "$GITHUB_SHA" '.draft and .target_commitish == $sha' <<<"$release"
-          tag=$(jq -r '.tag_name' <<<"$release")
-          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          tag=$(jq -r '.tag_name // ""' <<<"$release")
+          [[ "$tag" == "$RELEASE_TAG" || "$tag" == untagged-* || -z "$tag" ]]
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
   windows:
     needs: validate
@@ -130,15 +136,23 @@ jobs:
           set -euo pipefail
           release=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
           jq -e --arg sha "$GITHUB_SHA" '.draft and .target_commitish == $sha' <<<"$release"
-          tag=$(jq -r '.tag_name' <<<"$release")
           cd dist
           windows=PicoPark-Reproduce-Windows-x64-Setup.exe
           macos=PicoPark-Reproduce-macOS.dmg
           sha256sum "$windows" "$macos" > SHA256SUMS.txt
-          gh release upload "$tag" "$windows" "$macos" SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
           assets=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets")
+          for name in "$windows" "$macos" SHA256SUMS.txt; do
+            if jq -e --arg name "$name" '.[] | select(.name == $name and .state == "uploaded")' <<<"$assets" > /dev/null; then
+              expected=$(sha256sum "$name" | cut -d' ' -f1)
+              jq -e --arg name "$name" --arg digest "sha256:$expected" +                '.[] | select(.name == $name and .digest == $digest)' <<<"$assets" > /dev/null
+              continue
+            fi
+            curl --fail-with-body --silent --show-error +              -H "Authorization: Bearer $GH_TOKEN" -H 'Content-Type: application/octet-stream' +              --data-binary "@$name" +              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$name" |
+              jq -e --arg name "$name" '.name == $name and .state == "uploaded"'
+          done
           for name in player-windows.zip player-macos.zip; do
             id=$(jq -er --arg name "$name" '.[] | select(.name == $name) | .id' <<<"$assets")
             gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$id"
           done
-          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false --jq .html_url
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -f "tag_name=$RELEASE_TAG" -F draft=false --jq .html_url

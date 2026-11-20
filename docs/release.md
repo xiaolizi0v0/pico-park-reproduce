@@ -20,7 +20,7 @@
 ```sh
 gh release create v1.0.0 player-windows.zip player-macos.zip --draft --target "$(git rev-parse HEAD)" --title "1.0.0"
 gh api repos/{owner}/{repo}/releases --jq '.[] | select(.draft and .tag_name == "v1.0.0") | .id'
-gh workflow run release.yml -f release-id=<数字ID>
+gh workflow run release.yml -f release-id=<数字ID> -f tag=v1.0.0
 ```
 
 发布会附上 Windows 安装程序、macOS DMG 和 SHA-256 校验文件。Windows 安装程序按用户安装。macOS 应用使用临时签名，适用于预览分发；Developer ID 签名和公证需另行配置。
