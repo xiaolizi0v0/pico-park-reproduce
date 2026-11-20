@@ -1,0 +1,17 @@
+/[Ll]ibrary/
+/[Tt]emp/
+/[Ll]ogs/
+/[Oo]bj/
+/[Uu]ser[Ss]ettings/
+/[Bb]uild/
+/[Bb]uilds/
+/dist/
+/.codely*/
+/.com-unity-codely.json
+/.vs/
+/.vscode/
+*.csproj
+*.sln
+*.user
+*.log
+.DS_Store

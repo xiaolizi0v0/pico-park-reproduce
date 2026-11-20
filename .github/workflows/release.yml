@@ -1,0 +1,145 @@
+name: Package and publish desktop installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-id:
+        description: ID of the draft release containing both player archives
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ inputs.release-id }}
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  RELEASE_ID: ${{ inputs.release-id }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.draft.outputs.version }}
+    steps:
+      - name: Check the draft release and source commit
+        id: draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
+          jq -e --arg sha "$GITHUB_SHA" '.draft and .target_commitish == $sha' <<<"$release"
+          tag=$(jq -r '.tag_name' <<<"$release")
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: validate
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Retrieve Windows player
+        shell: bash
+        run: bash packaging/download-player.sh player-windows.zip player-windows.zip
+      - name: Compile and check the Windows installer
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Expand-Archive player-windows.zip player
+          if (!(Test-Path player/PicoPark.exe) -or !(Test-Path player/PicoPark_Data) -or !(Test-Path player/steam_appid.txt)) {
+            throw 'The Windows archive lacks the game executable, data, or Steam test settings.'
+          }
+          $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          if (!$iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          $player = (Resolve-Path player).Path
+          $output = (New-Item -ItemType Directory -Path dist -Force).FullName
+          & $iscc "/DAppVersion=$env:VERSION" "/DPlayerDir=$player" "/O$output" 'packaging/windows.iss'
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed.' }
+          $setup = Join-Path $output 'PicoPark-Reproduce-Windows-x64-Setup.exe'
+          if (!(Test-Path -LiteralPath $setup)) { throw 'The Windows installer was not produced.' }
+          $smoke = Join-Path $env:RUNNER_TEMP 'installed-game'
+          $process = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/DIR=`"$smoke`"") -PassThru -Wait -WindowStyle Hidden
+          if ($process.ExitCode -ne 0 -or !(Test-Path (Join-Path $smoke 'PicoPark.exe'))) {
+            throw 'The Windows installer failed its installation check.'
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/PicoPark-Reproduce-Windows-x64-Setup.exe
+          if-no-files-found: error
+          compression-level: 0
+
+  macos:
+    needs: validate
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Retrieve macOS player
+        shell: bash
+        run: bash packaging/download-player.sh player-macos.zip player-macos.zip
+      - name: Sign the preview app and verify the disk image
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging dist
+          ditto -x -k player-macos.zip staging
+          app=staging/PicoPark.app
+          executable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Contents/Info.plist")
+          binary="$app/Contents/MacOS/$executable"
+          test -f "$binary"
+          while IFS= read -r -d '' item; do
+            if file -b "$item" | grep -q 'Mach-O'; then chmod +x "$item"; fi
+          done < <(find "$app/Contents" -type f -print0)
+          lipo -archs "$binary"
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          ln -s /Applications staging/Applications
+          image=dist/PicoPark-Reproduce-macOS.dmg
+          hdiutil create -srcfolder staging -volname "Pico Park Reproduce" -format UDZO "$image"
+          hdiutil verify "$image"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: dist/PicoPark-Reproduce-macOS.dmg
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [validate, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-installer"
+          path: dist
+          merge-multiple: true
+      - name: Attach installers, checksums and publish the draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
+          jq -e --arg sha "$GITHUB_SHA" '.draft and .target_commitish == $sha' <<<"$release"
+          tag=$(jq -r '.tag_name' <<<"$release")
+          cd dist
+          windows=PicoPark-Reproduce-Windows-x64-Setup.exe
+          macos=PicoPark-Reproduce-macOS.dmg
+          sha256sum "$windows" "$macos" > SHA256SUMS.txt
+          gh release upload "$tag" "$windows" "$macos" SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
+          assets=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets")
+          for name in player-windows.zip player-macos.zip; do
+            id=$(jq -er --arg name "$name" '.[] | select(.name == $name) | .id' <<<"$assets")
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$id"
+          done
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false --jq .html_url
